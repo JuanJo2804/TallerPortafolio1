@@ -32,6 +32,10 @@ st.set_page_config(page_title="Nivel de estación — Quebrada la bolsa", page_i
 # Funciones de consulta
 # ------------------------------------------------------------------
 def obtener_serie_nivel(codigo_estacion, desde, hasta, calidad=1, timeout=30):
+    datos, error = obtener_serie_nivel(codigo, desde, hasta)
+    if datos:
+        st.write("Llaves de la raíz:", list(datos.keys()))
+        st.json(datos)  # inspecciona la estructura completa
     url = f"{API_BASE_URL}/{codigo_estacion}/nivel"
     params = {"desde": desde, "hasta": hasta, "calidad": calidad}
     headers = {
@@ -62,10 +66,7 @@ def obtener_todas_las_paginas(datos_json, timeout=30):
         siguiente_url = pagina.get("next")
     return registros
 
-datos, error = obtener_serie_nivel(codigo, desde, hasta)
-if datos:
-    st.write("Llaves de la raíz:", list(datos.keys()))
-    st.json(datos)  # inspecciona la estructura completa
+
     
 def detectar_coordenadas(datos_json):
     """Busca lat/lon en las llaves raíz de la respuesta. Si no las encuentra, usa el valor por defecto."""
