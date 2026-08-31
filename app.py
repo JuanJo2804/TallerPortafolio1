@@ -62,7 +62,11 @@ def obtener_todas_las_paginas(datos_json, timeout=30):
         siguiente_url = pagina.get("next")
     return registros
 
-
+datos, error = obtener_serie_nivel(codigo, desde, hasta)
+if datos:
+    st.write("Llaves de la raíz:", list(datos.keys()))
+    st.json(datos)  # inspecciona la estructura completa
+    
 def detectar_coordenadas(datos_json):
     """Busca lat/lon en las llaves raíz de la respuesta. Si no las encuentra, usa el valor por defecto."""
     if not isinstance(datos_json, dict):
