@@ -47,51 +47,35 @@ def obtener_serie_nivel(codigo_estacion, desde, hasta, calidad=1, timeout=30):
         return None, f"Error de red: {e}"
 
 
-def obtener_info_estacion(codigo_estacion, timeout=30):
-    url = f"{API_BASE_URL}/{codigo_estacion}"  # sin '/nivel'
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-    }
-    try:
-        resp = requests.get(url, headers=headers, timeout=timeout, verify=False)
-        if resp.status_code == 200:
-            return resp.json(), None
-        return None, f"HTTP {resp.status_code}"
-    except requests.exceptions.RequestException as e:
-        return None, f"Error de red: {e}"
+def obtener_todas_las_paginas(datos_json, timeout=30):
+    registros = list(datos_json.get("values", []))
+    siguiente_url = datos_json.get("next")
+    while siguiente_url:
+        try:
+            resp = requests.get(siguiente_url, timeout=timeout, verify=False)
+        except requests.exceptions.RequestException:
+            break
+        if resp.status_code != 200:
+            break
+        pagina = resp.json()
+        registros.extend(pagina.get("values", []))
+        siguiente_url = pagina.get("next")
+    return registros
+
 
 def detectar_coordenadas(datos_json):
+    """Busca lat/lon en las llaves raíz de la respuesta. Si no las encuentra, usa el valor por defecto."""
     if not isinstance(datos_json, dict):
         return LAT_DEFECTO, LON_DEFECTO, False
 
-    # Caso plano: lat/lng en la raíz
     lat = next((datos_json[k] for k in CANDIDATOS_LAT if k in datos_json), None)
     lon = next((datos_json[k] for k in CANDIDATOS_LON if k in datos_json), None)
+
     if lat is not None and lon is not None:
         try:
             return float(lat), float(lon), True
         except (TypeError, ValueError):
             pass
-
-    # Caso GeoJSON: geometry.coordinates = [lon, lat]
-    geometry = datos_json.get("geometry")
-    if isinstance(geometry, dict):
-        coords = geometry.get("coordinates")
-        if isinstance(coords, (list, tuple)) and len(coords) >= 2:
-            try:
-                return float(coords[1]), float(coords[0]), True
-            except (TypeError, ValueError):
-                pass
-
-    # Caso anidado: properties/estacion/station
-    for llave_anidada in ("properties", "estacion", "station"):
-        sub = datos_json.get(llave_anidada)
-        if isinstance(sub, dict):
-            lat, lon, ok = detectar_coordenadas(sub)
-            if ok:
-                return lat, lon, ok
-
     return LAT_DEFECTO, LON_DEFECTO, False
 
 
