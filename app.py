@@ -12,11 +12,11 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ------------------------------------------------------------------
-# Coordenadas por defecto (Institución Universitaria Pascual Bravo)
+# Coordenadas por defecto
 # Se usan solo si la API no trae la latitud/longitud de la estación.
 # ------------------------------------------------------------------
-LAT_DEFECTO = 6.2766
-LON_DEFECTO = -75.5901
+LAT_DEFECTO = 6.1806
+LON_DEFECTO = -75.32974
 
 API_BASE_URL = "https://marco.cornare.gov.co/api/v1/estaciones"
 
@@ -42,7 +42,7 @@ def obtener_serie_nivel(codigo_estacion, desde, hasta, calidad=1, timeout=30):
         resp = requests.get(url, params=params, headers=headers, timeout=timeout, verify=False)
         if resp.status_code == 200:
             return resp.json(), None
-        return None, f"HTTP {resp.status_code}"
+        return None, f"HTTP {resp.status_code} — {resp.text[:300]}"
     except requests.exceptions.RequestException as e:
         return None, f"Error de red: {e}"
 
@@ -63,7 +63,6 @@ def obtener_todas_las_paginas(datos_json, timeout=30):
     return registros
 
 
-    
 def detectar_coordenadas(datos_json):
     """Busca lat/lon en las llaves raíz de la respuesta. Si no las encuentra, usa el valor por defecto."""
     if not isinstance(datos_json, dict):
@@ -106,6 +105,66 @@ def calcular_indice_calidad(df):
     return round(indice, 1), int(huecos), int(es_outlier.sum())
 
 
+def analizar_missing_values(df):
+    """
+    Missing values reales: huecos en la serie de tiempo.
+    En una serie minuto a minuto, un "missing value" casi nunca aparece como
+    NaN explícito — aparece como un hueco: el sensor debía reportar y no lo hizo.
+    Para detectarlo correctamente comparamos contra la frecuencia esperada,
+    no solo contamos NaN directos.
+
+    Devuelve un diccionario con los resultados y el DataFrame reindexado
+    (df_regular) para poder inspeccionar los huecos exactos.
+    """
+    resultado = {
+        "nan_directos": 0,
+        "frecuencia_tipica": None,
+        "esperadas": 0,
+        "recibidas": 0,
+        "huecos": 0,
+        "porcentaje_huecos": 0.0,
+        "df_regular": None,
+        "huecos_detalle": None,
+    }
+
+    if df.empty or len(df) < 2:
+        return resultado
+
+    # 1) ¿Cuántos NaN directos hay?
+    resultado["nan_directos"] = int(df["nivel"].isna().sum())
+
+    # 2) ¿Cuál es la frecuencia típica de reporte de esta estación?
+    diferencias = df["fecha"].diff().dropna()
+    modas = diferencias.mode()
+    if len(modas) == 0:
+        return resultado
+    frecuencia_tipica = modas[0]
+    resultado["frecuencia_tipica"] = frecuencia_tipica
+
+    # 3) Reindexamos a esa frecuencia regular para exponer los huecos reales
+    df_indexado = df.set_index("fecha")
+    rango_completo = pd.date_range(
+        start=df_indexado.index.min(), end=df_indexado.index.max(), freq=frecuencia_tipica
+    )
+    df_regular = df_indexado.reindex(rango_completo)
+
+    huecos = int(df_regular["nivel"].isna().sum())
+    esperadas = len(rango_completo)
+
+    resultado["esperadas"] = esperadas
+    resultado["recibidas"] = df_indexado.shape[0]
+    resultado["huecos"] = huecos
+    resultado["porcentaje_huecos"] = round((huecos / esperadas) * 100, 2) if esperadas > 0 else 0.0
+    resultado["df_regular"] = df_regular
+
+    # Detalle de los timestamps donde el hueco ocurre
+    huecos_detalle = df_regular[df_regular["nivel"].isna()].copy()
+    huecos_detalle.index.name = "fecha_esperada"
+    resultado["huecos_detalle"] = huecos_detalle.reset_index()[["fecha_esperada"]]
+
+    return resultado
+
+
 # ------------------------------------------------------------------
 # Sidebar — parámetros de la consulta (editables por cada estudiante)
 # ------------------------------------------------------------------
@@ -128,7 +187,11 @@ if consultar:
         datos_crudos, error = obtener_serie_nivel(codigo_estacion, fecha_desde, fecha_hasta, calidad)
 
     if error:
-        st.error(f"❌ {error}")
+        st.error(f"❌ No se pudo conectar con el servidor: {error}")
+        st.caption(
+            "Verifica el código de estación, el rango de fechas, o que el servidor de CORNARE "
+            "esté disponible en este momento."
+        )
     else:
         registros = obtener_todas_las_paginas(datos_crudos)
 
@@ -139,10 +202,11 @@ if consultar:
             df = df.rename(columns={LLAVE_FECHA: "fecha", LLAVE_VALOR: "nivel"})
             df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
             df["nivel"] = pd.to_numeric(df["nivel"], errors="coerce")
-            df = df.dropna(subset=["fecha", "nivel"]).sort_values("fecha").reset_index(drop=True)
+            df = df.dropna(subset=["fecha"]).sort_values("fecha").reset_index(drop=True)
 
             lat, lon, coords_reales = detectar_coordenadas(datos_crudos)
-            indice_calidad, huecos, n_outliers = calcular_indice_calidad(df)
+            indice_calidad, huecos_idx, n_outliers = calcular_indice_calidad(df.dropna(subset=["nivel"]))
+            mv = analizar_missing_values(df)
 
             # --- Métricas principales ---
             col1, col2, col3, col4 = st.columns(4)
@@ -155,16 +219,57 @@ if consultar:
             st.subheader("Serie de nivel")
             st.line_chart(df.set_index("fecha")["nivel"])
 
-            # --- Mapa de la estación ---
+            # --- Ubicación de la estación ---
             st.subheader("Ubicación de la estación")
             if not coords_reales:
-                st.caption("La API no trajo latitud/longitud de la estación — se muestra el punto de partida (Pascual Bravo). Ajusta `CANDIDATOS_LAT` / `CANDIDATOS_LON` si conoces el nombre real de esas llaves.")
+                st.caption(
+                    "La API no trajo latitud/longitud de la estación — se muestra el punto de referencia "
+                    "configurado. Ajusta `CANDIDATOS_LAT` / `CANDIDATOS_LON` si conoces el nombre real de esas llaves."
+                )
             st.map(pd.DataFrame({"lat": [lat], "lon": [lon]}), zoom=10)
+
+            # --- Missing values reales ---
+            st.subheader("🕳️ Missing values reales (huecos en la serie de tiempo)")
+            st.caption(
+                "En una serie minuto a minuto, un *missing value* casi nunca aparece como NaN explícito — "
+                "aparece como un hueco: el sensor debía reportar y no lo hizo. Por eso comparamos la serie "
+                "contra su frecuencia esperada en lugar de solo contar NaN directos."
+            )
+
+            if mv["frecuencia_tipica"] is None:
+                st.info("No hay suficientes datos para estimar la frecuencia típica de reporte.")
+            else:
+                mcol1, mcol2, mcol3, mcol4 = st.columns(4)
+                mcol1.metric("NaN directos", mv["nan_directos"])
+                mcol2.metric("Frecuencia típica", str(mv["frecuencia_tipica"]))
+                mcol3.metric("Lecturas esperadas", mv["esperadas"])
+                mcol4.metric(
+                    "Huecos reales",
+                    mv["huecos"],
+                    delta=f"{mv['porcentaje_huecos']}%",
+                    delta_color="inverse",
+                )
+
+                with st.expander("Ver detalle de missing values"):
+                    st.write(f"- NaN directos en `nivel`: **{mv['nan_directos']}**")
+                    st.write(f"- Frecuencia típica entre lecturas: **{mv['frecuencia_tipica']}**")
+                    st.write(f"- Lecturas esperadas a frecuencia regular: **{mv['esperadas']}**")
+                    st.write(f"- Lecturas realmente recibidas: **{mv['recibidas']}**")
+                    st.write(
+                        f"- Huecos reales en la serie: **{mv['huecos']}** "
+                        f"({mv['porcentaje_huecos']}%)"
+                    )
+
+                    if mv["huecos"] > 0:
+                        st.markdown("**Timestamps esperados donde no llegó reporte:**")
+                        st.dataframe(mv["huecos_detalle"], use_container_width=True)
+                    else:
+                        st.success("No se detectaron huecos: la serie está completa a la frecuencia esperada.")
 
             # --- Detalle de calidad ---
             with st.expander("Detalle del índice de calidad"):
-                st.write(f"- Huecos de reporte detectados: **{huecos}**")
-                st.write(f"- Outliers (IQR + nivel negativo): **{n_outliers}** de {len(df)} lecturas")
+                st.write(f"- Huecos de reporte detectados (índice de calidad): **{huecos_idx}**")
+                st.write(f"- Outliers (IQR + nivel negativo): **{n_outliers}** de {len(df.dropna(subset=['nivel']))} lecturas")
                 st.write("El índice combina completitud de la serie (70%) y proporción de datos sin outliers (30%).")
 
             # --- Tabla y descarga ---
