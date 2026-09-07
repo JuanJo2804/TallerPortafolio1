@@ -132,4 +132,256 @@ def analizar_missing_values(df):
         "porcentaje_huecos": 0.0,
         "df_regular": None,
         "huecos_detalle": None,
-        "bloques_huecos":
+        "bloques_huecos": None,
+    }
+
+    if df.empty or len(df) < 2:
+        return resultado
+
+    # 1) ¿Cuántos NaN directos hay?
+    resultado["nan_directos"] = int(df["nivel"].isna().sum())
+
+    # 2) ¿Cuál es la frecuencia típica de reporte de esta estación?
+    diferencias = df["fecha"].diff().dropna()
+    modas = diferencias.mode()
+    if len(modas) == 0:
+        return resultado
+    frecuencia_tipica = modas[0]
+    resultado["frecuencia_tipica"] = frecuencia_tipica
+
+    # 3) Reindexamos a esa frecuencia regular para exponer los huecos reales
+    df_indexado = df.set_index("fecha")
+    rango_completo = pd.date_range(
+        start=df_indexado.index.min(), end=df_indexado.index.max(), freq=frecuencia_tipica
+    )
+    df_regular = df_indexado.reindex(rango_completo)
+
+    huecos = int(df_regular["nivel"].isna().sum())
+    esperadas = len(rango_completo)
+
+    resultado["esperadas"] = esperadas
+    resultado["recibidas"] = df_indexado.shape[0]
+    resultado["huecos"] = huecos
+    resultado["porcentaje_huecos"] = round((huecos / esperadas) * 100, 2) if esperadas > 0 else 0.0
+    resultado["df_regular"] = df_regular
+
+    huecos_detalle = df_regular[df_regular["nivel"].isna()].copy()
+    huecos_detalle.index.name = "fecha_esperada"
+    resultado["huecos_detalle"] = huecos_detalle.reset_index()[["fecha_esperada"]]
+
+    es_hueco = df_regular["nivel"].isna()
+    if es_hueco.any():
+        grupo = (es_hueco != es_hueco.shift()).cumsum()
+        bloques = []
+        for _, tramo in df_regular[es_hueco].groupby(grupo[es_hueco]):
+            inicio = tramo.index.min()
+            fin = tramo.index.max()
+            duracion = (fin - inicio) + frecuencia_tipica
+            bloques.append(
+                {
+                    "inicio": inicio,
+                    "fin": fin,
+                    "duracion": duracion,
+                    "lecturas_perdidas": len(tramo),
+                }
+            )
+        bloques_df = pd.DataFrame(bloques).sort_values("duracion", ascending=False).reset_index(drop=True)
+        resultado["bloques_huecos"] = bloques_df
+    else:
+        resultado["bloques_huecos"] = pd.DataFrame(columns=["inicio", "fin", "duracion", "lecturas_perdidas"])
+
+    return resultado
+
+
+# ------------------------------------------------------------------
+# Sidebar — solo lo que sigue siendo ajustable
+# ------------------------------------------------------------------
+st.sidebar.header("Parámetros de tu consulta")
+nombre_estudiante = st.sidebar.text_input("Nombre del estudiante", "Tu Nombre Aquí")
+
+st.sidebar.markdown(
+    f"""
+    **Estación:** `{CODIGO_ESTACION}`  
+    **Rango:** `{FECHA_DESDE}` → `{FECHA_HASTA}`
+    """
+)
+
+calidad = st.sidebar.selectbox("Calidad", [1, 0], index=0, help="1 = solo datos validados")
+tipo_grafico = st.sidebar.radio("Tipo de gráfico", ["Línea", "Área"], horizontal=True)
+consultar = st.sidebar.button("🔍 Consultar", type="primary")
+
+st.sidebar.divider()
+st.sidebar.caption("¿La API no responde? Sube un CSV exportado (columnas Fecha, Nivel) para analizarlo igual.")
+archivo_csv = st.sidebar.file_uploader("Cargar CSV de respaldo", type=["csv"])
+
+st.title("🌊 Nivel de ríos y quebradas — CORNARE")
+st.caption(f"Estudiante: **{nombre_estudiante}** · Estación: **{CODIGO_ESTACION}** · {FECHA_DESDE} → {FECHA_HASTA}")
+
+
+def mostrar_resultados(df, lat, lon, coords_reales, codigo_estacion):
+    """Renderiza todas las métricas, gráficos y análisis a partir de un df con columnas 'fecha' y 'nivel'."""
+    indice_calidad, huecos_idx, n_outliers = calcular_indice_calidad(df.dropna(subset=["nivel"]))
+    mv = analizar_missing_values(df)
+
+    # --- Métricas principales ---
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Lecturas", len(df))
+    col2.metric("Nivel promedio", f"{df['nivel'].mean():.2f}")
+    col3.metric("Índice de calidad", f"{indice_calidad} / 100")
+    col4.metric("Outliers detectados", n_outliers)
+
+    tab_grafico, tab_mapa, tab_missing, tab_datos = st.tabs(
+        ["📈 Serie de nivel", "📍 Ubicación", "🕳️ Missing values", "📄 Datos crudos"]
+    )
+
+    # --- Gráfico de la serie ---
+    with tab_grafico:
+        serie = mv["df_regular"]["nivel"] if mv.get("df_regular") is not None else df.set_index("fecha")["nivel"]
+        if tipo_grafico == "Área":
+            st.area_chart(serie)
+        else:
+            st.line_chart(serie)
+        if mv.get("bloques_huecos") is not None and not mv["bloques_huecos"].empty:
+            st.caption(
+                "Los tramos vacíos de la línea corresponden a los huecos detectados "
+                "(ver pestaña *Missing values*)."
+            )
+
+    # --- Ubicación de la estación ---
+    with tab_mapa:
+        if coords_reales:
+            st.caption(f"Coordenadas reportadas por la API: `{lat}, {lon}`")
+        else:
+            st.caption(
+                f"La API no trajo latitud/longitud real de la estación — se muestra la coordenada "
+                f"fija configurada en el código: `LAT_DEFECTO = {lat}`, `LON_DEFECTO = {lon}`."
+            )
+        st.map(pd.DataFrame({"lat": [lat], "lon": [lon]}), zoom=10)
+
+    # --- Missing values reales ---
+    with tab_missing:
+        st.caption(
+            "En una serie minuto a minuto, un *missing value* casi nunca aparece como NaN explícito — "
+            "aparece como un hueco: el sensor debía reportar y no lo hizo. Por eso comparamos la serie "
+            "contra su frecuencia esperada en lugar de solo contar NaN directos."
+        )
+
+        if mv["frecuencia_tipica"] is None:
+            st.info("No hay suficientes datos para estimar la frecuencia típica de reporte.")
+        else:
+            mcol1, mcol2, mcol3, mcol4 = st.columns(4)
+            mcol1.metric("NaN directos", mv["nan_directos"])
+            mcol2.metric("Frecuencia típica", str(mv["frecuencia_tipica"]))
+            mcol3.metric("Lecturas esperadas", mv["esperadas"])
+            mcol4.metric(
+                "Huecos reales",
+                mv["huecos"],
+                delta=f"{mv['porcentaje_huecos']}%",
+                delta_color="inverse",
+            )
+
+            bloques = mv.get("bloques_huecos")
+            if bloques is not None and not bloques.empty:
+                st.markdown("**Cortes detectados (huecos consecutivos agrupados en un solo bloque):**")
+                bloques_mostrar = bloques.copy()
+                bloques_mostrar["duracion"] = bloques_mostrar["duracion"].astype(str)
+                st.dataframe(
+                    bloques_mostrar.rename(
+                        columns={
+                            "inicio": "Sin datos desde",
+                            "fin": "Sin datos hasta",
+                            "duracion": "Duración del corte",
+                            "lecturas_perdidas": "Lecturas perdidas",
+                        }
+                    ),
+                    use_container_width=True,
+                )
+                corte_mas_largo = bloques.iloc[0]
+                st.warning(
+                    f"⚠️ El corte más largo va de **{corte_mas_largo['inicio']}** a "
+                    f"**{corte_mas_largo['fin']}** ({corte_mas_largo['duracion']}, "
+                    f"{int(corte_mas_largo['lecturas_perdidas'])} lecturas perdidas)."
+                )
+
+            with st.expander("Ver detalle minuto a minuto de los huecos"):
+                st.write(f"- NaN directos en `nivel`: **{mv['nan_directos']}**")
+                st.write(f"- Frecuencia típica entre lecturas: **{mv['frecuencia_tipica']}**")
+                st.write(f"- Lecturas esperadas a frecuencia regular: **{mv['esperadas']}**")
+                st.write(f"- Lecturas realmente recibidas: **{mv['recibidas']}**")
+                st.write(f"- Huecos reales en la serie: **{mv['huecos']}** ({mv['porcentaje_huecos']}%)")
+
+                if mv["huecos"] > 0:
+                    st.markdown("**Timestamps esperados donde no llegó reporte:**")
+                    st.dataframe(mv["huecos_detalle"], use_container_width=True)
+                else:
+                    st.success("No se detectaron huecos: la serie está completa a la frecuencia esperada.")
+
+        with st.expander("Detalle del índice de calidad"):
+            st.write(f"- Huecos de reporte detectados (índice de calidad): **{huecos_idx}**")
+            st.write(f"- Outliers (IQR + nivel negativo): **{n_outliers}** de {len(df.dropna(subset=['nivel']))} lecturas")
+            st.write("El índice combina completitud de la serie (70%) y proporción de datos sin outliers (30%).")
+
+    # --- Tabla y descarga ---
+    with tab_datos:
+        st.dataframe(df, use_container_width=True)
+        csv_salida = df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Descargar CSV", csv_salida, file_name=f"nivel_estacion_{codigo_estacion}.csv", mime="text/csv"
+        )
+
+
+# ------------------------------------------------------------------
+# Fuente de datos: CSV cargado manualmente (tiene prioridad si se sube)
+# ------------------------------------------------------------------
+if archivo_csv is not None:
+    try:
+        df_csv = pd.read_csv(archivo_csv)
+        columnas = {c.lower(): c for c in df_csv.columns}
+        col_fecha = columnas.get("fecha") or columnas.get(LLAVE_FECHA.lower())
+        col_nivel = columnas.get("nivel") or columnas.get(LLAVE_VALOR.lower())
+
+        if col_fecha is None or col_nivel is None:
+            st.error(
+                "❌ El CSV debe tener una columna de fecha (`Fecha`) y una de nivel (`Nivel`). "
+                f"Columnas encontradas: {list(df_csv.columns)}"
+            )
+        else:
+            df = df_csv.rename(columns={col_fecha: "fecha", col_nivel: "nivel"})[["fecha", "nivel"]]
+            df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+            df["nivel"] = pd.to_numeric(df["nivel"], errors="coerce")
+            df = df.dropna(subset=["fecha"]).sort_values("fecha").reset_index(drop=True)
+
+            st.success(f"✅ Analizando **{archivo_csv.name}** ({len(df)} lecturas).")
+            mostrar_resultados(df, LAT_DEFECTO, LON_DEFECTO, False, CODIGO_ESTACION)
+    except Exception as e:
+        st.error(f"❌ No se pudo leer el CSV: {e}")
+
+# ------------------------------------------------------------------
+# Fuente de datos: API de CORNARE
+# ------------------------------------------------------------------
+elif consultar:
+    with st.spinner("Consultando la API..."):
+        datos_crudos, error = obtener_serie_nivel(CODIGO_ESTACION, FECHA_DESDE, FECHA_HASTA, calidad)
+
+    if error:
+        st.error(f"❌ No se pudo conectar con el servidor: {error}")
+        st.caption(
+            "Verifica que el servidor de CORNARE esté disponible en este momento. "
+            "Mientras tanto puedes cargar un CSV de respaldo en el sidebar."
+        )
+    else:
+        registros = obtener_todas_las_paginas(datos_crudos)
+
+        if not registros:
+            st.warning("No hay registros para esta estación y rango de fechas.")
+        else:
+            df = pd.DataFrame(registros)
+            df = df.rename(columns={LLAVE_FECHA: "fecha", LLAVE_VALOR: "nivel"})
+            df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+            df["nivel"] = pd.to_numeric(df["nivel"], errors="coerce")
+            df = df.dropna(subset=["fecha"]).sort_values("fecha").reset_index(drop=True)
+
+            lat, lon, coords_reales = detectar_coordenadas(datos_crudos)
+            mostrar_resultados(df, lat, lon, coords_reales, CODIGO_ESTACION)
+else:
+    st.info(f"Presiona **Consultar** para traer la estación `{CODIGO_ESTACION}` ({FECHA_DESDE} → {FECHA_HASTA}), o carga un CSV de respaldo.")
